@@ -85,7 +85,8 @@ def _run_case(batch, seq_q, seq_k, heads, causal, dtype="bf16", **kw):
     (q, k, v, out, dout, lse), refs = _make_case(batch, seq_q, seq_k, heads, causal, _DT[dtype], scale)
     grads = flash_attn_bwd_gfx1250(dout, q, k, v, out, lse, causal=causal, softmax_scale=scale, **kw)
     torch.cuda.synchronize()
-    tol = 2e-2 if dtype == "bf16" else 1e-2
+    # bf16/f16 rounding of P and dS dominates: ~2.5e-3 (bf16) and ~3e-4 (f16) relative.
+    tol = 1e-2 if dtype == "bf16" else 2e-3
     for name, g, ref in zip(("dq", "dk", "dv"), grads, refs):
         assert torch.isfinite(g).all(), f"{name} has non-finite values"
         err = _rel_err(g, ref)

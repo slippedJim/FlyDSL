@@ -111,11 +111,11 @@ def _f32_ptr(arg):
 
 
 class _Frags:
-    """LDS -> WMMA operand fragments for one wave (16 bf16 per lane, packed as 8 x i32)."""
+    """LDS -> WMMA operand fragments for one wave (16 bf16/f16 per lane, packed as 8 x i32)."""
 
     def __init__(self, elem_cls, lane16, kgrp):
         self.elem_cls = elem_cls
-        self.load_b128, self.store_b128 = make_lds_copy_ops(128)
+        self.load_b128 = make_lds_copy_ops(128)[0]
         # Row read: lane16 picks the row, each half-wave takes alternate 8-element chunks of K.
         self.row_lane = lane16 * LDS_ROW + kgrp * 16
         # Transposed read: an 8-lane group fetches an 8x8 block that ds_load_tr16_b128 transposes,
@@ -285,9 +285,8 @@ def launch_flash_attn_bwd_dkdv_gfx1250(
         bh = fx.Int32(bid_bh)
         kv0 = fx.Int32(bid_n) * BLOCK_N
         row_b = fx.Int64(i32_heads) * ROW_B
-        batch_off = (fx.Int64(bh // i32_heads) * fx.Int64(i32_heads) * ROW_B) * fx.Int64(i32_sq)
         head_off = fx.Int64(bh % i32_heads) * ROW_B
-        q_off = batch_off + head_off
+        q_off = fx.Int64(bh // i32_heads) * fx.Int64(i32_sq) * row_b + head_off
         k_off = (fx.Int64(bh // i32_heads) * fx.Int64(i32_sk) + fx.Int64(kv0)) * row_b + head_off
         stat_off = fx.Int64(bh) * fx.Int64(i32_sq_pad) * 4
 
@@ -322,6 +321,7 @@ def launch_flash_attn_bwd_dkdv_gfx1250(
             (fx.rocdl.make_tdm_atom(d_gt, [1, i32_sq * 4], num_warps=1), d_gt, 2 * TILE_B + block_m * 4, False),
         ]
 
+        # Waves 0 and 1 load the resident K/V block; the streamed tiles go to the next waves.
         def issue(qb, s):
             q_start = fx.Int32(qb) * block_m
             for j in range_constexpr(len(q_jobs)):
@@ -339,7 +339,7 @@ def launch_flash_attn_bwd_dkdv_gfx1250(
         if const_expr(causal):
             offs = i32_sk - i32_sq
             q_lo = fx.min(fx.max(kv0 - offs, 0) // block_m, n_qb)
-            q_mid = fx.max(fx.min((fx.max(kv0 + (BLOCK_N - 1) - offs, 0) + (block_m - 1)) // block_m, n_qb), q_lo)
+            q_mid = fx.min((fx.max(kv0 + (BLOCK_N - 1) - offs, 0) + (block_m - 1)) // block_m, n_qb)
         else:
             q_lo = fx.Int32(0)
             q_mid = fx.Int32(0)
@@ -535,9 +535,8 @@ def launch_flash_attn_bwd_dq_gfx1250(
         n_kb = (i32_sk + (block_n - 1)) // block_n
         if const_expr(causal):
             offs = i32_sk - i32_sq
-            kv_hi = fx.min(fx.max(q0 + BLOCK_M + offs, 0) + (block_n - 1), fx.max(i32_sk, 0) + (block_n - 1))
-            kv_hi = fx.min(kv_hi // block_n, n_kb)
-            kv_mid = fx.min(fx.min(fx.max(q0 + offs + 1, 0) // block_n, i32_sk // block_n), kv_hi)
+            kv_hi = (fx.min(fx.max(q0 + BLOCK_M + offs, 0), i32_sk) + (block_n - 1)) // block_n
+            kv_mid = fx.min(fx.min(fx.max(q0 + offs + 1, 0), i32_sk) // block_n, kv_hi)
         else:
             kv_hi = n_kb
             kv_mid = i32_sk // block_n
@@ -560,7 +559,7 @@ def launch_flash_attn_bwd_dq_gfx1250(
         delta = fx.Float32(_f32_ptr(arg_delta)[stat])
         dq = [_zeros8() for _ in range_constexpr(D_TILES)]
         scale_log2 = f32_scale * LOG2E
-        # Key kv0 + 16 * kt + 8 * kgrp + v is visible iff 16 * kt + v < k_lim + (offset of kv0).
+        # Key kv0 + 16 * kt + 8 * kgrp + v is visible iff 16 * kt + v < k_lim - kv0.
         k_lim = i32_sk - 8 * kgrp
         if const_expr(causal):
             k_lim = fx.min(k_lim, q_idx + (i32_sk - i32_sq) + 1 - 8 * kgrp)
@@ -660,8 +659,7 @@ def flash_attn_bwd_gfx1250(
         raise ValueError("q, k, v, out and dout must share one dtype: bf16 or f16")
     if seq_q < 1 or seq_k < 1:
         raise ValueError("seq_q and seq_k must be positive")
-    tensors = (dout, q, k, v, out, softmax_lse)
-    if not all(t.is_contiguous() for t in tensors):
+    if not all(t.is_contiguous() for t in (dout, q, k, v, out, softmax_lse)):
         raise ValueError("flash_attn_bwd_gfx1250 expects contiguous inputs")
     _check_tiles(num_waves, block_m)
     _check_tiles(num_waves, block_n)
