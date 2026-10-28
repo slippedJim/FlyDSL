@@ -12,6 +12,7 @@ This guide covers the available FlyDSL kernels — normalization, softmax, GEMM,
 | **Softmax backward** | `build_softmax_bwd_module(N, dtype)` | Layout API (`@flyc.kernel`) | f32, f16, bf16 | fp32 dot reduction, native-dtype register buffering |
 | **GEMM** | `compile_preshuffle_gemm(...)` | `@flyc.kernel` | fp8, int8, fp16, bf16 | Preshuffle B, ping-pong LDS, MFMA 16x16 |
 | **FlashAttention** | `build_flash_attn_func_module(...)` | `@flyc.kernel` | bf16, f16 (any arch); fp8 e4m3fn (gfx950, D=128, dense) | Dual-wave SWP fwd, GQA/MQA, causal, descale ABI |
+| **FlashAttention backward** | `flash_attn_bwd_gfx1250(dout, q, k, v, out, lse, ...)` | `@flyc.kernel` | bf16, f16 (gfx1250, D=128, MHA) | dQ/dK/dV without atomics, TDM + WMMA, causal |
 | **Convolution** | `flydsl_conv_implicit(x, weight, ...)` | Layout API (`@flyc.kernel`) | bf16 (gfx950) | Implicit GEMM, 1D/2D/3D, heuristic tile pick or opt-in autotune, runtime resolution |
 
 All kernels use the `@flyc.kernel`/`@flyc.jit` API from `flydsl.compiler` and `flydsl.expr` (`python/flydsl/`).
@@ -373,6 +374,40 @@ python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --warmup 3 --iters 3
 python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --compare --warmup 10 --iters 50
 ```
 
+### gfx1250 backward (`kernels/attention/flash_attn_bwd_gfx1250.py`)
+
+MHA backward for `head_dim == 128` on gfx1250, bf16 or f16. It takes the
+forward's output and its fp32 `[B, H, Sq]` natural-log LSE and returns
+`(dq, dk, dv)`. Causal masking is bottom-right aligned, as in the forward.
+`seq_q` and `seq_k` are arbitrary and may differ.
+
+```python
+from kernels.attention.flash_attn_bwd_gfx1250 import flash_attn_bwd_gfx1250
+
+# q/out/dout: [B, Sq, H, 128], k/v: [B, Sk, H, 128], contiguous; lse: fp32 [B, H, Sq]
+dq, dk, dv = flash_attn_bwd_gfx1250(dout, q, k, v, out, lse, causal=True)
+```
+
+It issues three launches, with no atomics:
+
+| Launch | Work per workgroup | Computes |
+|---|---|---|
+| preprocess | 16 rows | `Delta = rowsum(dO * O)`, `LSE * log2(e)` (a `-inf` LSE becomes `+inf`) |
+| dK/dV | `16 * num_waves` keys, streaming `block_m` queries | `dV += P^T dO`, `dK += dS^T Q` |
+| dQ | `16 * num_waves` queries, streaming `block_n` keys | `dQ += dS K` |
+
+Each kernel double-buffers the streamed tiles in LDS through TDM. The resident
+rows' fragments stay in registers. P and dS feed the next WMMA straight from the
+accumulator layout. The operand that reduces over the sequence is read from the
+same row-major LDS tile with `ds_load_tr16_b128`. Diagonal and tail blocks run
+a masked copy of the loop body.
+
+```bash
+python3 -m pytest tests/kernels/test_flash_attn_bwd_gfx1250.py -v    # gfx1250 device
+python3 tests/kernels/test_flash_attn_bwd_gfx1250.py -sq 4096 -heads 16 -causal -bench
+python3 -m pytest tests/unit/test_flash_attn_bwd_gfx1250_compile.py  # compile-only, any host
+```
+
 ---
 
 ## 3c. Implicit-GEMM convolution (`kernels/conv/conv3d_implicit.py`)
@@ -517,6 +552,9 @@ What operation do you need?
 │   └── Standard MoE (fp8/f16/bf16/int8/int4)
 │       └── → kernels/moe/moe_gemm_2stage/
 │
+├── Attention backward
+│   └── gfx1250, D=128, MHA   → flash_attn_bwd_gfx1250() (kernels/attention/flash_attn_bwd_gfx1250.py)
+│
 ├── Convolution (1D/2D/3D)
 │   ├── bf16, gfx950          → flydsl_conv_implicit() (kernels/conv/conv3d_implicit.py)
 │   └── fp8 e4m3fn, gfx95x    → conv3d_implicit_fp8() (kernels/conv/conv3d_implicit_fp8.py)
@@ -539,6 +577,7 @@ What operation do you need?
 | `kernels/attention/flash_attn_generic.py` | FlashAttention generic fallback |
 | `kernels/attention/flash_attn_gfx950.py` | FlashAttention gfx950 bf16/f16 fast path |
 | `kernels/attention/flash_attn_fp8_gfx950.py` | FlashAttention gfx950 fp8 dense fast path |
+| `kernels/attention/flash_attn_bwd_gfx1250.py` | FlashAttention backward, gfx1250 bf16/f16 D=128 |
 | `kernels/norm/layernorm_kernel.py` | LayerNorm (layout API) |
 | `kernels/norm/rmsnorm_kernel.py` | RMSNorm (layout API) |
 | `kernels/norm/softmax_kernel.py` | Softmax (layout API) |
@@ -571,6 +610,7 @@ What operation do you need?
 | `tests/kernels/test_moe_reduce.py` | MoE reduce kernel |
 | `tests/kernels/test_pa.py` | Paged attention decode |
 | `tests/kernels/test_flash_attn_fwd.py` | FlashAttention |
+| `tests/kernels/test_flash_attn_bwd_gfx1250.py` | FlashAttention backward (gfx1250) |
 | `tests/kernels/test_layernorm.py` | LayerNorm |
 | `tests/kernels/test_rmsnorm.py` | RMSNorm |
 | `tests/kernels/test_softmax.py` | Softmax |
